@@ -248,7 +248,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ws.title = "Уборка"
         ws.append(["Дата", "№ Номера", "Горничная", "Тип", "Статус", "Комментарий"])
         for rid, room_no, maid, maid_tg_id, ctype, status, comment in rows:
-        ws.append([d, room_no, maid or "", ctype, status, comment or ""])
+            ws.append([d, room_no, maid or "", ctype, status, comment or ""])
 
         bio = io.BytesIO()
         wb.save(bio)
