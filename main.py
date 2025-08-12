@@ -1,5 +1,6 @@
 
-import os, io, csv, pytz, pandas as pd
+import os, io, csv, pytz
+from openpyxl import Workbook
 from datetime import datetime, timedelta, time
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
