@@ -203,11 +203,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text or ""
+
+    # --- режим ввода комментария к номеру ---
     if "await_comment_for" in context.user_data:
         rid = context.user_data.pop("await_comment_for")
         set_comment(rid, txt, update.message.from_user.full_name)
         await update.message.reply_text("Комментарий сохранён 📝")
         return
+
+    # --- команда /iam Имя ---
     if txt.startswith("/iam "):
         name = txt[5:].strip()
         if not name:
@@ -217,12 +221,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Готово! Сохранил имя: {name}")
         return
 
-    # проксируем команды
-    if txt.startswith("/plan"): await cmd_plan(update, context); return
-    if txt.startswith("/my"): await cmd_my(update, context); return
-    if txt.startswith("/report"): await cmd_report(update, context); return
-    if txt.startswith("/upload_plan"): await cmd_upload_plan(update, context); return
-    if txt.startswith("/resetday"): await cmd_resetday(update, context); return
+    # --- /export_csv ---
     if txt.startswith("/export_csv"):
         d = day_str()
         rows = get_rooms(d)
@@ -232,7 +231,59 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for rid, room_no, maid, maid_tg_id, ctype, status, comment in rows:
             writer.writerow([d, room_no, maid or "", ctype, status, comment or ""])
         buff.seek(0)
-        await update.message.reply_document(document=InputFile(io.BytesIO(buff.getvalue().encode("utf-8")), filename=f"cleaning_{d}.csv"))
+        await update.message.reply_document(
+            document=InputFile(io.BytesIO(buff.getvalue().encode("utf-8")),
+                               filename=f"cleaning_{d}.csv")
+        )
+        return
+
+    # --- /export_xlsx (через openpyxl, БЕЗ pandas) ---
+    if txt.startswith("/export_xlsx"):
+        from openpyxl import Workbook
+        d = day_str()
+        rows = get_rooms(d)
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Уборка"
+        ws.append(["Дата", "№ Номера", "Горничная", "Тип", "Статус", "Комментарий"])
+        for rid, room_no, maid, maid_tg_id, ctype, status, comment in rows:
+            ws.append([d, room_no, maid or "", ctype, status, comment or ""])
+
+        bio = io.BytesIO()
+        wb.save(bio)
+        bio.seek(0)
+        await update.message.reply_document(
+            document=InputFile(bio, filename=f"cleaning_{d}.xlsx")
+        )
+        return
+
+    # --- проксирование основных команд ---
+    if txt.startswith("/plan"):
+        await cmd_plan(update, context); return
+    if txt.startswith("/my"):
+        await cmd_my(update, context); return
+    if txt.startswith("/report"):
+        await cmd_report(update, context); return
+    if txt.startswith("/upload_plan"):
+        await cmd_upload_plan(update, context); return
+    if txt.startswith("/resetday"):
+        await cmd_resetday(update, context); return
+    if txt.startswith("/set_tz "):
+        # админская: /set_tz Asia/Tashkent
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("Только админ.")
+            return
+        tz = txt[8:].strip()
+        try:
+            _ = pytz.timezone(tz)
+        except Exception:
+            await update.message.reply_text("Некорректный часовой пояс.")
+            return
+        global TIMEZONE
+        TIMEZONE = tz
+        set_setting("TIMEZONE", tz)
+        await update.message.reply_text(f"Часовой пояс установлен: {tz}")
         return
     if update.message.text.startswith("/export_xlsx"):
     d = day_str()
