@@ -239,24 +239,24 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- /export_xlsx (через openpyxl, БЕЗ pandas) ---
     if txt.startswith("/export_xlsx"):
-        from openpyxl import Workbook
-        d = day_str()
-        rows = get_rooms(d)
+    from openpyxl import Workbook
+    d = day_str()
+    rows = get_rooms(d)
 
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Уборка"
-        ws.append(["Дата", "№ Номера", "Горничная", "Тип", "Статус", "Комментарий"])
-        for rid, room_no, maid, maid_tg_id, ctype, status, comment in rows:
-            ws.append([d, room_no, maid or "", ctype, status, comment or ""])
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Уборка"
+    ws.append(["Дата", "№ Номера", "Горничная", "Тип", "Статус", "Комментарий"])
+    for rid, room_no, maid, maid_tg_id, ctype, status, comment in rows:
+        ws.append([d, room_no, maid or "", ctype, status, comment or ""])
 
-        bio = io.BytesIO()
-        wb.save(bio)
-        bio.seek(0)
-        await update.message.reply_document(
-            document=InputFile(bio, filename=f"cleaning_{d}.xlsx")
-        )
-        return
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    await update.message.reply_document(
+        document=InputFile(bio, filename=f"cleaning_{d}.xlsx")
+    )
+    return
 
     # --- проксирование основных команд ---
     if txt.startswith("/plan"):
@@ -286,7 +286,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Часовой пояс установлен: {tz}")
         return
     if update.message.text.startswith("/export_xlsx"):
-    d = day_str()
+        d = day_str()
     rows = get_rooms(d)
 
     wb = Workbook()
