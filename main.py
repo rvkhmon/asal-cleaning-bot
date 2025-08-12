@@ -240,7 +240,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- /export_xlsx (через openpyxl, БЕЗ pandas) ---
     if txt.startswith("/export_xlsx"):
     from openpyxl import Workbook
-    d = day_str()
+       d = day_str()
     rows = get_rooms(d)
 
     wb = Workbook()
