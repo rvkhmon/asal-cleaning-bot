@@ -234,19 +234,25 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buff.seek(0)
         await update.message.reply_document(document=InputFile(io.BytesIO(buff.getvalue().encode("utf-8")), filename=f"cleaning_{d}.csv"))
         return
-    if txt.startswith("/export_xlsx"):
-        d = day_str()
-        rows = get_rooms(d)
-        df = pd.DataFrame([{
-            "Дата": d, "№ Номера": room_no, "Горничная": maid or "", "Тип": ctype, "Статус": status, "Комментарий": comment or ""
-        } for rid, room_no, maid, maid_tg_id, ctype, status, comment in rows])
-        bio = io.BytesIO()
-        with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Уборка")
-        bio.seek(0)
-        await update.message.reply_document(document=InputFile(bio, filename=f"cleaning_{d}.xlsx"))
-        return
+    if update.message.text.startswith("/export_xlsx"):
+    d = day_str()
+    rows = get_rooms(d)
 
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Уборка"
+    ws.append(["Дата", "№ Номера", "Горничная", "Тип", "Статус", "Комментарий"])
+
+    for rid, room_no, maid, maid_tg_id, ctype, status, comment in rows:
+        ws.append([d, room_no, maid or "", ctype, status, comment or ""])
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    await update.message.reply_document(
+        document=InputFile(bio, filename=f"cleaning_{d}.xlsx")
+    )
+    return
 def schedule_jobs(app):
     # ежедневный отчёт
     if REPORT_CHAT_ID and REPORT_TIME:
