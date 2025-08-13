@@ -1,9 +1,8 @@
 # main.py
-# ASAL Cleaning Bot — production-ready
-# Работает с python-telegram-bot v21.x
+# ASAL Cleaning Bot — production-ready for python-telegram-bot v21.x
 
 import os, io, csv, pytz
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time as dtime
 
 from dotenv import load_dotenv
 from openpyxl import Workbook
@@ -16,8 +15,7 @@ from telegram.ext import (
     CallbackQueryHandler, filters, ContextTypes
 )
 
-# ==== DB helpers (из db.py) ====
-# Предполагаются функции с такими именами/сигнатурами:
+# ==== DB helpers (ожидаются в db.py) ====
 # init_db()
 # add_plan_rows(date_str, rows: list[dict])
 # get_rooms(date_str) -> list[(id, room_no, maid, maid_tg_id, ctype, status, comment)]
@@ -55,7 +53,7 @@ ADMIN_IDS = set(
 # Диагностика env (без вывода токена)
 bt = (BOT_TOKEN or "").strip()
 print(f"[ENV] BOT_TOKEN set? {'yes' if bt else 'no'}; length={len(bt)}")
-print(f"[ENV] TIMEZONE={TIMEZONE!r} REPORT_TIME={REPORT_TIME!r} AUTOCARRYOVER={AUTOCARRYOVER}")
+print(f"[ENV] TIMEZONE='{TIMEZONE}' REPORT_TIME='{REPORT_TIME}' AUTOCARRYOVER={AUTOCARRYOVER}")
 print(f"[ENV] REPORT_CHAT_ID={REPORT_CHAT_ID} ADMIN_IDS={sorted(ADMIN_IDS) if ADMIN_IDS else '[]'}")
 
 if not bt or ":" not in bt:
@@ -130,7 +128,6 @@ async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = day_str()
     rows = get_rooms_for_maid(d, update.effective_user.id)
     if not rows:
-        # fallback: если нет привязки — подсказка
         u = get_user(update.effective_user.id)
         if not u:
             await update.message.reply_text("Сначала укажи имя: /iam Имя")
@@ -160,7 +157,6 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total, done, left, percent = stats(d)
     msg = f"🧹 Отчёт за {d}\n\nВсего: {total}\nУбрано: {done}\nОсталось: {left}\nГотово: {percent}%"
     sent = await update.message.reply_text(msg)
-    # пробуем закрепить, если это групповой чат
     try:
         if update.effective_chat.type in ("group", "supergroup"):
             await context.bot.pin_chat_message(update.effective_chat.id, sent.message_id, disable_notification=True)
@@ -200,14 +196,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нужен именно CSV-файл.")
         return
 
-    # скачиваем
     file = await doc.get_file()
     bio = io.BytesIO()
     await file.download_to_memory(out=bio)
     bio.seek(0)
     text = bio.read().decode("utf-8-sig").strip()
 
-    # парсим
     reader = csv.DictReader(io.StringIO(text))
     rows = []
     for row in reader:
@@ -227,7 +221,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("await_plan", None)
 
     await update.message.reply_text(f"Загрузил план на {d}: {len(rows)} строк.")
-    # покажем сводку
     await cmd_report(update, context)
 
 # ==== text (/export_csv, /export_xlsx, /iam echo, etc) ====
@@ -305,7 +298,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Нет прав менять статус", show_alert=True)
 
     elif action == "tp":  # toggle type
-        new_type = toggle_type(rid)
+        toggle_type(rid)
         r2 = get_room(rid)
         await q.edit_message_text(room_row_to_text(r2), reply_markup=room_row_kb(r2))
 
@@ -330,30 +323,41 @@ async def carryover_left(context: ContextTypes.DEFAULT_TYPE):
     if not AUTOCARRYOVER:
         return
     today = now_local().date()
-    tomorrow = datetime.combine(today + timedelta(days=1), time(9,0)).astimezone(tz())
-    # перенос реализован на стороне БД (в твоём db.py — clear_date/add_plan_rows можно использовать)
-    # Здесь простой вариант: выбираем “не убрано” и переносим с теми же параметрами.
+    tomorrow_dt = datetime.combine(today + timedelta(days=1), dtime(9, 0)).astimezone(tz())
     rows = [r for r in get_rooms(day_str()) if r[5] != "done"]
     if not rows:
         return
     carry = []
     for _, room_no, maid, _, ctype, status, comment in rows:
         carry.append({"room_no": room_no, "maid": maid or "", "cleaning_type": ctype})
-    add_plan_rows(day_str(tomorrow), carry)
+    add_plan_rows(day_str(tomorrow_dt), carry)
     if REPORT_CHAT_ID:
         await context.bot.send_message(REPORT_CHAT_ID, f"🔁 Перенёс на завтра: {len(carry)} номеров.")
 
-# ==== app ====
 def schedule_daily_jobs(app):
-    # автоотчёт в REPORT_TIME local
+    # Если job_queue недоступен — не падаем, просто без расписания
+    if getattr(app, "job_queue", None) is None:
+        print("[WARN] JobQueue is not available. Scheduled jobs are disabled.")
+        return
+
     try:
-        hh, mm = [int(x) for x in REPORT_TIME.split(":")]
+        hh, mm = [int(x) for x in str(REPORT_TIME).split(":")]
     except Exception:
         hh, mm = 18, 0
-    app.job_queue.run_daily(send_report, time=time(hh, mm), name="daily_report", timezone=tz())
-    # перенос в 23:55 local
-    app.job_queue.run_daily(carryover_left, time=time(23,55), name="carryover", timezone=tz())
 
+    tzinfo = tz()  # pytz.timezone
+    app.job_queue.run_daily(
+        send_report,
+        time=dtime(hh, mm, tzinfo=tzinfo),
+        name="daily_report",
+    )
+    app.job_queue.run_daily(
+        carryover_left,
+        time=dtime(23, 55, tzinfo=tzinfo),
+        name="carryover",
+    )
+
+# ==== app ====
 def main():
     init_db()
 
