@@ -1,390 +1,356 @@
-# main.py
-# ASAL Cleaning Bot — production-ready for python-telegram-bot v21.x
-
-import os, io, csv, pytz
+import os
+import io
+import csv
+import re
+import sqlite3
 from datetime import datetime, timedelta, time as dtime
+from typing import List, Tuple, Optional
 
+import pytz
 from dotenv import load_dotenv
 from openpyxl import Workbook
 
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-)
+from telegram import Update, InputFile
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, filters, ContextTypes
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
 
-# ==== DB helpers (ожидаются в db.py) ====
-# init_db()
-# add_plan_rows(date_str, rows: list[dict])
-# get_rooms(date_str) -> list[(id, room_no, maid, maid_tg_id, ctype, status, comment)]
-# get_rooms_for_maid(date_str, tg_id) -> list[...]
-# get_room(room_id) -> tuple(...)
-# set_status(room_id, status_str)
-# toggle_type(room_id) -> new_type
-# set_comment(room_id, text, author)
-# clear_date(date_str)
-# stats(date_str) -> (total, done, left, percent)
-# upsert_user(tg_id, name)
-# get_user(tg_id) -> dict|None { 'id', 'tg_id', 'name' }
-# set_setting(key, value), get_setting(key)
-from db import (
-    init_db, add_plan_rows, get_rooms, get_rooms_for_maid, get_room,
-    set_status, toggle_type, set_comment, clear_date, stats,
-    upsert_user, get_user, set_setting, get_setting
-)
-
-# ==== ENV ====
+# ───────────────────────────────────────────────────────────────────────────────
+# Конфиг из окружения
+# ───────────────────────────────────────────────────────────────────────────────
 load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TIMEZONE = os.getenv("TIMEZONE", "Asia/Tashkent").strip() or "Asia/Tashkent"
+REPORT_CHAT_ID = int(os.getenv("REPORT_CHAT_ID", "0") or 0)
+REPORT_TIME = os.getenv("REPORT_TIME", "18:00").strip() or "18:00"
+AUTOCARRYOVER = os.getenv("AUTOCARRYOVER", "true").lower() == "true"
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-TIMEZONE = os.getenv("TIMEZONE", "Asia/Tashkent")
-REPORT_CHAT_ID = int(os.getenv("REPORT_CHAT_ID", "0") or "0")
-REPORT_TIME = os.getenv("REPORT_TIME", "18:00")
-AUTOCARRYOVER = (os.getenv("AUTOCARRYOVER", "true").lower() == "true")
+def tz() -> pytz.BaseTzInfo:
+    try:
+        return pytz.timezone(TIMEZONE)
+    except Exception:
+        return pytz.timezone("Asia/Tashkent")
 
-# список админов по tg id (через запятую)
-ADMIN_IDS = set(
-    int(x.strip()) for x in (os.getenv("ADMIN_IDS", "") or "").split(",")
-    if x.strip().isdigit()
-)
-
-# Диагностика env (без вывода токена)
-bt = (BOT_TOKEN or "").strip()
-print(f"[ENV] BOT_TOKEN set? {'yes' if bt else 'no'}; length={len(bt)}")
-print(f"[ENV] TIMEZONE='{TIMEZONE}' REPORT_TIME='{REPORT_TIME}' AUTOCARRYOVER={AUTOCARRYOVER}")
-print(f"[ENV] REPORT_CHAT_ID={REPORT_CHAT_ID} ADMIN_IDS={sorted(ADMIN_IDS) if ADMIN_IDS else '[]'}")
-
-if not bt or ":" not in bt:
-    raise ValueError(
-        "❌ BOT_TOKEN не найден или некорректен. "
-        "Задай его в Render → Environment → BOT_TOKEN=<токен от @BotFather>."
-    )
-
-# ==== time helpers ====
-def tz():
-    return pytz.timezone(TIMEZONE)
-
-def now_local():
+def now_local() -> datetime:
     return datetime.now(tz())
 
-def day_str(dt: datetime | None = None):
+def day_str(dt: Optional[datetime] = None) -> str:
     return (dt or now_local()).strftime("%Y-%m-%d")
 
-# ==== permissions ====
-def is_admin(tg_id: int) -> bool:
-    return (len(ADMIN_IDS) == 0) or (tg_id in ADMIN_IDS)
+# ───────────────────────────────────────────────────────────────────────────────
+# БД (SQLite)
+# ───────────────────────────────────────────────────────────────────────────────
+DB_PATH = "asal.db"
 
-# ==== keyboards & formatting ====
-def room_row_to_text(r):
-    _, room_no, maid, _, ctype, status, comment = r
-    s = "✅ Убрано" if status == "done" else "⏳ Не убрано"
-    cm = f"\n📝 {comment}" if (comment or "").strip() else ""
-    return f"№{room_no} • {ctype} • {s}\nГорничная: {maid or '-'}{cm}"
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def room_row_kb(r):
-    rid = r[0]
-    _, room_no, maid, _, ctype, status, comment = r
-    togglestatus = "↩️ Отметить НЕ убрано" if status == "done" else "✅ Отметить убрано"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(togglestatus, callback_data=f"st:{rid}")],
-        [InlineKeyboardButton("🔁 Тип (Полная/Текущая)", callback_data=f"tp:{rid}")],
-        [InlineKeyboardButton("📝 Комментарий", callback_data=f"cm:{rid}")]
-    ])
+def init_db():
+    conn = db()
+    with conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS plan (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day TEXT NOT NULL,
+                room_no INTEGER NOT NULL,
+                maid TEXT NOT NULL,
+                ctype TEXT NOT NULL,     -- Полная / Текущая
+                status TEXT NOT NULL DEFAULT 'Назначено', -- Назначено/В процессе/Готово/Не убрано
+                comment TEXT
+            )
+        """)
+    conn.close()
 
-# ==== commands ====
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! Это бот учёта уборки.\n\n"
-        "Основные команды:\n"
-        "• /iam Имя — указать своё имя (для горничной)\n"
-        "• /my — мои номера на сегодня\n"
-        "• /report — отчёт по дню\n"
-        "• /upload_plan — загрузить план CSV (админ)\n"
-        "• /export_csv, /export_xlsx — выгрузка текущего дня\n"
-        "• /chatid — показать Chat ID\n"
-        "• /resetday — очистить план на сегодня (админ)\n"
+init_db()
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Утилиты БД
+# ───────────────────────────────────────────────────────────────────────────────
+def clear_day(day: str):
+    conn = db()
+    with conn:
+        conn.execute("DELETE FROM plan WHERE day=?", (day,))
+    conn.close()
+
+def insert_rows(day: str, rows: List[Tuple[int, str, str]]):
+    conn = db()
+    with conn:
+        conn.executemany(
+            "INSERT INTO plan(day, room_no, maid, ctype) VALUES (?,?,?,?)",
+            [(day, int(r), m, c) for r, m, c in rows],
+        )
+    conn.close()
+
+def get_rooms(day: str):
+    conn = db()
+    cur = conn.execute(
+        "SELECT room_no, maid, ctype, status, COALESCE(comment,'') comment "
+        "FROM plan WHERE day=? ORDER BY room_no", (day,)
     )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
-async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    title = getattr(chat, "title", "") or "(нет названия)"
-    await update.message.reply_text(f"Chat ID: {chat.id}\nНазвание: {title}")
+def get_stats(day: str):
+    conn = db()
+    cur = conn.execute(
+        "SELECT "
+        "COUNT(*) as total, "
+        "SUM(CASE WHEN status='Готово' THEN 1 ELSE 0 END) as done, "
+        "SUM(CASE WHEN status!='Готово' THEN 1 ELSE 0 END) as left "
+        "FROM plan WHERE day=?", (day,)
+    )
+    row = cur.fetchone()
+    conn.close()
+    total = row["total"] or 0
+    done = row["done"] or 0
+    left = row["left"] or 0
+    return total, done, left
 
-async def cmd_iam(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = (update.message.text or "").split(maxsplit=1)
-    if len(args) < 2:
-        await update.message.reply_text("Пример: /iam Севара")
+# ───────────────────────────────────────────────────────────────────────────────
+# Парсер CSV — «железобетонный»
+# ───────────────────────────────────────────────────────────────────────────────
+def _decode_bytes(b: bytes) -> str:
+    # 1) UTF-8 (включая BOM)
+    try:
+        return b.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    # 2) Windows-1251
+    try:
+        return b.decode("cp1251")
+    except UnicodeDecodeError:
+        # 3) На край — игнор битых символов
+        return b.decode("utf-8", errors="ignore")
+
+def parse_plan_csv_bytes(b: bytes) -> List[Tuple[int, str, str]]:
+    """
+    Возвращает список кортежей: (room_no, maid, ctype)
+    Поддерживает:
+    - кодировки: utf-8/utf-8-sig/cp1251
+    - разделители: запятая или точка с запятой
+    - наличие/отсутствие заголовка
+    - пробелы вокруг значений
+    """
+    txt = _decode_bytes(b)
+    rows: List[Tuple[int, str, str]] = []
+
+    for raw in txt.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = re.split(r"[;,]", line)
+        parts = [p.strip() for p in parts if p.strip() != ""]
+        if len(parts) < 3:
+            # возможно это заголовок или мусор
+            continue
+        room, maid, ctype = parts[0], parts[1], parts[2]
+        # пропустим строку, если это заголовок
+        if not room.isdigit():
+            # допускаем, что это строка заголовка — просто скипаем
+            continue
+        try:
+            rno = int(room)
+        except ValueError:
+            continue
+        rows.append((rno, maid, ctype))
+    return rows
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Команды
+# ───────────────────────────────────────────────────────────────────────────────
+HELP_TEXT = (
+    "Привет! Я бот учёта уборок.\n\n"
+    "Доступные команды:\n"
+    "/upload_plan — загрузить план (CSV)\n"
+    "/report — отчёт за сегодня\n"
+    "/export_csv — выгрузить план в CSV\n"
+    "/export_xlsx — выгрузить план в XLSX\n"
+    "/clear_today — очистить сегодняшний план (админ)\n\n"
+    "Формат CSV (без заголовков):\n"
+    "`101,Севара,Полная`\n"
+    "`102,Гульноз,Текущая`\n"
+    "Допускаются: UTF-8/UTF-8-BOM/cp1251, запятая или `;`.\n"
+)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+
+def _is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS or (REPORT_CHAT_ID != 0 and user_id == REPORT_CHAT_ID)
+
+async def clear_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("Только админы могут очищать план.")
         return
-    name = args[1].strip()
-    if not name:
-        await update.message.reply_text("Пример: /iam Севара")
-        return
-    upsert_user(update.effective_user.id, name=name)
-    await update.message.reply_text(f"Готово! Сохранил имя: {name}")
-
-async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = day_str()
-    rows = get_rooms_for_maid(d, update.effective_user.id)
-    if not rows:
-        u = get_user(update.effective_user.id)
-        if not u:
-            await update.message.reply_text("Сначала укажи имя: /iam Имя")
-            return
-        await update.message.reply_text("На сегодня номеров не назначено.")
-        return
-    for r in rows:
-        await update.message.reply_text(room_row_to_text(r), reply_markup=room_row_kb(r))
+    clear_day(d)
+    await update.message.reply_text(f"План на {d} очищен.")
 
-async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Только админ.")
-        return
+async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    d = day_str()
+    total, done, left = get_stats(d)
+    rows = get_rooms(d)
+    lines = [f"🧹 Отчёт за {d}\nВсего: {total} | Готово: {done} | Осталось: {left}", ""]
+    by_maid = {}
+    for r in rows:
+        by_maid.setdefault(r["maid"], []).append(r)
+    for maid, lst in sorted(by_maid.items()):
+        lines.append(f"— {maid}: {len(lst)} номеров")
+    await update.message.reply_text("\n".join(lines))
+
+async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = day_str()
     rows = get_rooms(d)
-    if not rows:
-        await update.message.reply_text("План на сегодня пуст.")
-        return
-    text = "📋 План на сегодня:\n\n"
+    buff = io.StringIO()
+    w = csv.writer(buff)
+    # заголовок — можно убрать, если не нужно
+    w.writerow(["Дата", "№ Номера", "Горничная", "Тип", "Статус", "Комментарий"])
     for r in rows:
-        _, room_no, maid, _, ctype, status, comment = r
-        text += f"№{room_no} • {ctype} • {('✅' if status=='done' else '—')} • {maid or '-'}\n"
-    await update.message.reply_text(text)
-
-async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d = day_str()
-    total, done, left, percent = stats(d)
-    msg = f"🧹 Отчёт за {d}\n\nВсего: {total}\nУбрано: {done}\nОсталось: {left}\nГотово: {percent}%"
-    sent = await update.message.reply_text(msg)
-    try:
-        if update.effective_chat.type in ("group", "supergroup"):
-            await context.bot.pin_chat_message(update.effective_chat.id, sent.message_id, disable_notification=True)
-    except Exception:
-        pass
-
-async def cmd_resetday(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Только админ.")
-        return
-    d = day_str()
-    clear_date(d)
-    await update.message.reply_text(f"Удалил план на {d}.")
-
-async def cmd_upload_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Только админ.")
-        return
-    context.user_data["await_plan"] = True
-    await update.message.reply_text(
-        "Пришлите CSV-файл плана. Формат:\n"
-        "`room_no,maid,cleaning_type`\n\n"
-        "Пример:\n"
-        "101,Севара,Полная\n"
-        "102,Гульноз,Текущая",
-        parse_mode="Markdown"
+        w.writerow([d, r["room_no"], r["maid"], r["ctype"], r["status"], r["comment"]])
+    buff.seek(0)
+    await update.message.reply_document(
+        document=InputFile(io.BytesIO(buff.getvalue().encode("utf-8")), filename=f"cleaning_{d}.csv")
     )
 
-# ==== document (CSV) ====
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("await_plan"):
-        return
+async def export_xlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    d = day_str()
+    rows = get_rooms(d)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Уборка"
+    ws.append(["Дата", "№ Номера", "Горничная", "Тип", "Статус", "Комментарий"])
+    for r in rows:
+        ws.append([d, r["room_no"], r["maid"], r["ctype"], r["status"], r["comment"]])
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    await update.message.reply_document(
+        document=InputFile(bio, filename=f"cleaning_{d}.xlsx")
+    )
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Загрузка плана
+# ───────────────────────────────────────────────────────────────────────────────
+UPLOAD_PROMPT = (
+    "Пришлите CSV-файл плана.\n"
+    "Формат строк: `room_no,maid,cleaning_type` (например: `101,Севара,Полная`).\n"
+    "Допускаются кодировки UTF-8 / UTF-8-BOM / cp1251, разделители `,` или `;`.\n"
+)
+
+async def upload_plan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["await_csv"] = True
+    await update.message.reply_text(UPLOAD_PROMPT, parse_mode="Markdown")
+
+async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # принимаем файл либо после /upload_plan, либо если это CSV
     doc = update.message.document
     if not doc:
         return
-    if not (doc.mime_type and "csv" in doc.mime_type.lower()) and not doc.file_name.lower().endswith(".csv"):
-        await update.message.reply_text("Нужен именно CSV-файл.")
+
+    filename = (doc.file_name or "").lower()
+    expecting = context.user_data.get("await_csv", False)
+    if not expecting and not filename.endswith(".csv"):
         return
 
-    file = await doc.get_file()
-    bio = io.BytesIO()
-    await file.download_to_memory(out=bio)
-    bio.seek(0)
-    text = bio.read().decode("utf-8-sig").strip()
-
-    reader = csv.DictReader(io.StringIO(text))
-    rows = []
-    for row in reader:
-        room_no = str(row.get("room_no", "")).strip()
-        maid = (row.get("maid", "") or "").strip()
-        ctype = (row.get("cleaning_type", "") or "").strip() or "Текущая"
-        if not room_no:
-            continue
-        rows.append({"room_no": room_no, "maid": maid, "cleaning_type": ctype})
+    f = await doc.get_file()
+    b = await f.download_as_bytearray()
+    rows = parse_plan_csv_bytes(bytes(b))
 
     if not rows:
-        await update.message.reply_text("В CSV не нашёл строк.")
-        return
-
-    d = day_str()
-    add_plan_rows(d, rows)
-    context.user_data.pop("await_plan", None)
-
-    await update.message.reply_text(f"Загрузил план на {d}: {len(rows)} строк.")
-    await cmd_report(update, context)
-
-# ==== text (/export_csv, /export_xlsx, /iam echo, etc) ====
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text or ""
-
-    # режим ввода комментария
-    if "await_comment_for" in context.user_data:
-        rid = context.user_data.pop("await_comment_for")
-        set_comment(rid, txt, update.message.from_user.full_name)
-        await update.message.reply_text("Комментарий сохранён 📝")
-        return
-
-    if txt.startswith("/iam "):
-        await cmd_iam(update, context)
-        return
-
-    if txt.startswith("/export_csv"):
-        d = day_str()
-        rows = get_rooms(d)
-        buff = io.StringIO()
-        writer = csv.writer(buff)
-        writer.writerow(["work_date", "room_no", "maid", "cleaning_type", "status", "comment"])
-        for rid, room_no, maid, maid_tg_id, ctype, status, comment in rows:
-            writer.writerow([d, room_no, maid or "", ctype, status, comment or ""])
-        buff.seek(0)
-        await update.message.reply_document(
-            document=InputFile(io.BytesIO(buff.getvalue().encode("utf-8")),
-                               filename=f"cleaning_{d}.csv")
+        preview = _decode_bytes(bytes(b))[:160].replace("\n", "\\n")
+        await update.message.reply_text(
+            "В CSV не нашёл строк.\n"
+            "Проверьте: разделители (`,` или `;`), кодировку (UTF-8/UTF-8-BOM/cp1251), "
+            "и отсутствие пустых строк/заголовков.\n\n"
+            f"*Первые символы файла:* `{preview}`",
+            parse_mode="Markdown",
         )
         return
 
-    if txt.startswith("/export_xlsx"):
-        d = day_str()
-        rows = get_rooms(d)
-
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Уборка"
-        ws.append(["Дата", "№ Номера", "Горничная", "Тип", "Статус", "Комментарий"])
-        for rid, room_no, maid, maid_tg_id, ctype, status, comment in rows:
-            ws.append([d, room_no, maid or "", ctype, status, comment or ""])
-
-        bio = io.BytesIO()
-        wb.save(bio)
-        bio.seek(0)
-        await update.message.reply_document(
-            document=InputFile(bio, filename=f"cleaning_{d}.xlsx")
-        )
-        return
-
-# ==== callbacks (кнопки) ====
-async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data or ""
-    if ":" not in data:
-        return
-    action, rid = data.split(":", 1)
-    rid = int(rid)
-
-    if action == "st":  # toggle status
-        r = get_room(rid)
-        if not r:
-            return
-        _, _, maid, maid_tg_id, _, status, _ = r
-        user_id = update.effective_user.id
-        # менять может назначенная горничная или админ
-        if (maid_tg_id and user_id == maid_tg_id) or is_admin(user_id):
-            new_status = "todo" if status == "done" else "done"
-            set_status(rid, new_status)
-            r2 = get_room(rid)
-            await q.edit_message_text(room_row_to_text(r2), reply_markup=room_row_kb(r2))
-        else:
-            await q.answer("Нет прав менять статус", show_alert=True)
-
-    elif action == "tp":  # toggle type
-        toggle_type(rid)
-        r2 = get_room(rid)
-        await q.edit_message_text(room_row_to_text(r2), reply_markup=room_row_kb(r2))
-
-    elif action == "cm":  # comment
-        context.user_data["await_comment_for"] = rid
-        await q.edit_message_reply_markup(None)
-        await q.message.reply_text("Напишите комментарий к этому номеру:")
-
-# ==== scheduled jobs ====
-async def send_report(context: ContextTypes.DEFAULT_TYPE):
     d = day_str()
-    total, done, left, percent = stats(d)
-    msg = f"🧹 Автоотчёт за {d}\n\nВсего: {total}\nУбрано: {done}\nОсталось: {left}\nГотово: {percent}%"
-    if REPORT_CHAT_ID:
-        m = await context.bot.send_message(REPORT_CHAT_ID, msg)
-        try:
-            await context.bot.pin_chat_message(REPORT_CHAT_ID, m.message_id, disable_notification=True)
-        except Exception:
-            pass
+    # Если включён автоперенос — очищаем сегодняшний план и заливаем заново
+    clear_day(d)
+    insert_rows(d, rows)
+    total, done, left = get_stats(d)
+    context.user_data["await_csv"] = False
+    await update.message.reply_text(
+        f"Загружено строк: {len(rows)} ✅\n"
+        f"Всего: {total} | Готово: {done} | Осталось: {left}"
+    )
 
-async def carryover_left(context: ContextTypes.DEFAULT_TYPE):
-    if not AUTOCARRYOVER:
-        return
-    today = now_local().date()
-    tomorrow_dt = datetime.combine(today + timedelta(days=1), dtime(9, 0)).astimezone(tz())
-    rows = [r for r in get_rooms(day_str()) if r[5] != "done"]
-    if not rows:
-        return
-    carry = []
-    for _, room_no, maid, _, ctype, status, comment in rows:
-        carry.append({"room_no": room_no, "maid": maid or "", "cleaning_type": ctype})
-    add_plan_rows(day_str(tomorrow_dt), carry)
-    if REPORT_CHAT_ID:
-        await context.bot.send_message(REPORT_CHAT_ID, f"🔁 Перенёс на завтра: {len(carry)} номеров.")
-
-def schedule_daily_jobs(app):
-    # Если job_queue недоступен — не падаем, просто без расписания
-    if getattr(app, "job_queue", None) is None:
-        print("[WARN] JobQueue is not available. Scheduled jobs are disabled.")
-        return
-
+# ───────────────────────────────────────────────────────────────────────────────
+# Автоотчёт по расписанию (без параметра timezone)
+# ───────────────────────────────────────────────────────────────────────────────
+def next_run_utc() -> datetime:
+    """Вычисляем следующий запуск в UTC, исходя из локальной таймзоны и REPORT_TIME."""
+    hh, mm = 18, 0
     try:
-        hh, mm = [int(x) for x in str(REPORT_TIME).split(":")]
+        hh, mm = [int(x) for x in REPORT_TIME.split(":")]
     except Exception:
-        hh, mm = 18, 0
+        pass
 
-    tzinfo = tz()  # pytz.timezone
-    app.job_queue.run_daily(
-        send_report,
-        time=dtime(hh, mm, tzinfo=tzinfo),
-        name="daily_report",
-    )
-    app.job_queue.run_daily(
-        carryover_left,
-        time=dtime(23, 55, tzinfo=tzinfo),
-        name="carryover",
-    )
+    local_today = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if local_today <= now_local():
+        local_today += timedelta(days=1)
+    return local_today.astimezone(pytz.UTC)
 
-# ==== app ====
+async def send_report(context: ContextTypes.DEFAULT_TYPE):
+    if not REPORT_CHAT_ID:
+        return
+    d = day_str()
+    total, done, left = get_stats(d)
+    msg = f"🧹 Ежедневный отчёт {d}\nВсего: {total} | Готово: {done} | Осталось: {left}"
+    try:
+        await context.bot.send_message(chat_id=REPORT_CHAT_ID, text=msg)
+    except Exception:
+        pass
+
+def schedule_daily_job(app):
+    # Первое срабатывание — в рассчитанное время, дальше — каждые 24 часа
+    first_run = next_run_utc()
+    app.job_queue.run_repeating(send_report, interval=24*60*60, first=first_run)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Main
+# ───────────────────────────────────────────────────────────────────────────────
+def validate_env():
+    print(f"[ENV] BOT_TOKEN set? {'yes' if BOT_TOKEN else 'no'}; length={len(BOT_TOKEN)}")
+    print(f"[ENV] TIMEZONE='{TIMEZONE}' REPORT_TIME='{REPORT_TIME}' AUTOCARRYOVER={AUTOCARRYOVER}")
+    print(f"[ENV] REPORT_CHAT_ID={REPORT_CHAT_ID} ADMIN_IDS={ADMIN_IDS}")
+    if not BOT_TOKEN:
+        raise ValueError("❌ BOT_TOKEN не найден. Задайте его в Render → Environment → BOT_TOKEN=<токен от @BotFather>.")
+
 def main():
-    init_db()
-
+    validate_env()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # команды
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("chatid", cmd_chatid))
-    app.add_handler(CommandHandler("iam", cmd_iam))
-    app.add_handler(CommandHandler("my", cmd_my))
-    app.add_handler(CommandHandler("plan", cmd_plan))
-    app.add_handler(CommandHandler("report", cmd_report))
-    app.add_handler(CommandHandler("resetday", cmd_resetday))
-    app.add_handler(CommandHandler("upload_plan", cmd_upload_plan))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("upload_plan", upload_plan_cmd))
+    app.add_handler(CommandHandler("report", report))
+    app.add_handler(CommandHandler("export_csv", export_csv))
+    app.add_handler(CommandHandler("export_xlsx", export_xlsx))
+    app.add_handler(CommandHandler("clear_today", clear_today))
 
-    # документы CSV (после /upload_plan)
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
 
-    # текстовые хендлеры: /export_csv, /export_xlsx, комментарии
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
+    # Автоотчёт
+    schedule_daily_job(app)
 
-    # callback-кнопки
-    app.add_handler(CallbackQueryHandler(on_cb))
-
-    schedule_daily_jobs(app)
-
-    print("✅ Bot is running...")
+    print("Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
